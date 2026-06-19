@@ -443,8 +443,6 @@ shareProcessNamespace: true
 
 but this is not the default behavior.
 
-# Kubernetes Networking
-
 ## Network Namespaces
 
 Every container gets its own isolated network stack. This includes:

@@ -573,3 +573,109 @@ Routing table ──────────────────────
 | IP Masquerading | Replaces pod IP with node IP for outbound traffic |
 | iptables | Applies the masquerade rule on the first packet |
 | conntrack | Records the NAT mapping; handles reverse translation on return |
+
+# Cgroups and Container Filesystem
+
+## Cgroups (Control Groups)
+
+**What enforces Kubernetes resource limits?**
+Linux **cgroups** (control groups). When you set CPU or memory limits on a pod, Kubernetes translates those into cgroup rules that the Linux kernel enforces directly.
+
+### Memory limit behaviour
+
+If a container exceeds its memory limit, the Linux **OOM Killer** (Out-Of-Memory Killer) steps in and kills the offending process. The pod status will show:
+
+```
+OOMKilled
+```
+
+### CPU limit behaviour
+
+CPU is handled differently — **no process is killed**. Instead, the kernel **throttles** the process: it is paused for a slice of time until the next scheduling window, keeping usage within the allowed limit.
+
+| Resource | Exceeds limit | Process killed? |
+|---|---|---|
+| Memory | OOM Killer terminates the process | Yes |
+| CPU | Kernel throttles (pauses) the process | No |
+
+---
+
+## Container Filesystem
+
+### Image layers
+
+A container image is made of **read-only layers**, usually built from a `Dockerfile`. Each of these instructions typically creates a new filesystem layer:
+
+```dockerfile
+FROM    # base image layer
+RUN     # runs a command, result becomes a layer
+ADD     # adds files, creates a layer
+COPY    # copies files, creates a layer
+```
+
+Once an image is built, its layers are **immutable** — they never change.
+
+### Union filesystem (OverlayFS)
+
+At runtime, the container engine uses a **union filesystem** (typically OverlayFS) to merge all the image layers into a single unified view. The container sees one normal-looking filesystem, but behind the scenes it is composed of stacked layers:
+
+```
+lower layers  =  read-only image content (base OS, app binaries, deps)
+upper layer   =  container's writable changes
+```
+
+OverlayFS uses four directories to achieve this:
+
+| Directory | Purpose |
+|---|---|
+| `lowerdir` | Read-only image layers |
+| `upperdir` | Writable layer for this container's changes |
+| `workdir` | Internal scratch space used by OverlayFS (not visible to the container) |
+| `mergeddir` | The unified view the container actually sees |
+
+```
+       Container sees: mergeddir (unified view)
+                              │
+          ┌───────────────────┴───────────────────┐
+          │                                       │
+   lowerdir (read-only image)           upperdir (writable)
+```
+
+### Writable layer and copy-on-write
+
+When a container modifies its filesystem, all changes go into the **writable upper layer** — the original image layers are never touched. This is called **copy-on-write (CoW)**:
+
+- **Reading a file** — served directly from the lower (image) layer, fast and cheap.
+- **Modifying an existing file** — the file is first copied from the lower layer into the upper layer, then the change is applied there.
+- **Creating a new file** — written directly into the upper layer.
+- **Deleting a file** — the file is not actually removed from the lower layer. OverlayFS creates a special marker called a **whiteout** that hides the file from the merged view.
+
+> The writable layer is **ephemeral** — it exists only for the lifetime of the container. When the container is removed, all changes are lost unless stored in a volume.
+
+### Layer comparison
+
+| Feature | Image layer | Writable layer | Volume |
+|---|---|---|---|
+| Created when | Image build | Container start | Created separately |
+| Writable | No | Yes | Yes |
+| Persistent | Yes | No | Yes |
+| Shared across containers | Yes (same image) | No | Can be |
+| Good for | App binaries, dependencies | Temporary changes | Persistent data |
+
+---
+
+## How `docker exec` sees the filesystem
+
+When you run:
+
+```bash
+docker exec -it mycontainer sh
+```
+
+You are starting a **new process** inside the same set of namespaces as the running container, including the same **mount namespace**. This means the `exec` process sees exactly the same filesystem as the container:
+
+- The same merged OverlayFS view
+- Any files created or modified by the container during its lifetime
+- All mounted volumes, secrets, and configs
+
+> `docker exec` does not create a new filesystem. It attaches to the existing one. Whatever the container has written to its upper layer is immediately visible.

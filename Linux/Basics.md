@@ -679,3 +679,190 @@ You are starting a **new process** inside the same set of namespaces as the runn
 - All mounted volumes, secrets, and configs
 
 > `docker exec` does not create a new filesystem. It attaches to the existing one. Whatever the container has written to its upper layer is immediately visible.
+
+# Processes and Threads
+
+## What is a process?
+
+A process is a **running instance of an application**. Each process lives in its own isolated environment. The OS gives every process its own:
+
+- Virtual memory space
+- File descriptors
+- Security context
+- Environment variables
+- PID (Process ID)
+
+Because of this isolation, processes cannot accidentally read or corrupt each other's memory.
+
+## What is a thread?
+
+A thread is an **execution unit inside a process**. Multiple threads live inside the same process and share:
+
+- Memory (heap)
+- Open files
+- Environment variables
+
+But each thread has its own:
+
+- Stack
+- Registers
+- Program counter (tracks which instruction is currently executing)
+
+## Process vs thread
+
+| | Process | Thread |
+|---|---|---|
+| Memory | Own private memory | Shared with other threads |
+| Creation cost | Expensive | Cheap (no new memory space needed) |
+| Isolation | Strong | None within the same process |
+| Crash impact | Only that process affected | Can crash the whole process |
+
+> A typical Java application runs as **1 process** but may spawn **200+ threads** inside it. All those threads share the same heap memory but execute independently.
+
+---
+
+## PIDs
+
+Each process gets exactly **one PID**. Threads inside a process share that process's PID (though the kernel gives each thread its own thread ID internally, this is not exposed the same way).
+
+---
+
+## Virtual memory vs physical memory (RAM)
+
+If a pod shows 10 GB of virtual memory usage, **it does not mean 10 GB of RAM is consumed.**
+
+Virtual memory is the address space a process *reserves* — it is a map of what memory *could* be used. Physical RAM is only allocated when that memory is actually accessed.
+
+When you run `top`, you see three memory columns:
+
+| Column | Name | What it means |
+|---|---|---|
+| `VIRT` | Virtual memory | Total address space reserved by the process. Often inflated and misleading. |
+| `RES` | Resident memory | Actual physical RAM currently in use. This is the real number. |
+| `SHR` | Shared memory | Portion of RES that is shared with other processes (e.g. shared libraries). |
+
+> Senior engineers look at **RES**, not `VIRT`. Virtual memory is almost always an overcount — the kernel uses lazy allocation and won't back it with real RAM until the process actually touches it.
+
+# Linux Networking Fundamentals
+
+## OSI Layers (quick reference)
+
+| Layer | Protocol | Address type | Example |
+|---|---|---|---|
+| Layer 2 | Ethernet | MAC address | `00:1f:3f:55:ab:db` |
+| Layer 3 | IP | IP address | `192.168.1.1` |
+| Layer 4 | TCP / UDP | Port number | `80`, `443`, `3306` |
+
+---
+
+## Layer 2 — Ethernet and MAC addresses
+
+Ethernet is the protocol used to move frames between devices **on the same local network**. Every network interface has a unique **MAC address** (hardware address), 6 bytes long:
+
+```
+00:1f:3f:55:ab:db
+```
+
+MAC addresses are used for delivery within a single network segment. They are not routable across the internet — that is IP's job.
+
+---
+
+## Layer 3 — IP Routing
+
+IP addresses are used to deliver packets **across networks**. Linux decides where to send each packet by consulting the **routing table**.
+
+```bash
+ip route
+```
+
+Example output:
+
+```
+default via 192.168.1.1 dev eth0
+192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.100
+```
+
+- The first line says: for any destination not matched below, send to the gateway `192.168.1.1`.
+- The second line says: for the local subnet, deliver directly via `eth0`.
+
+---
+
+## ARP — Address Resolution Protocol
+
+IP routing tells Linux *which interface* to use. But Ethernet needs a **MAC address** to actually deliver the frame. This is where ARP comes in.
+
+When Linux wants to send a packet to `10.10.11.2`, it asks: *"Who has this IP? Tell me your MAC."* The answer is cached in the **ARP table**:
+
+```
+10.10.11.2  →  00:f1:22:33:44
+```
+
+View the ARP cache:
+
+```bash
+arp -n
+# or
+ip neigh
+```
+
+> ARP only works within the same Layer 2 network segment. For destinations on other networks, Linux ARPs for the gateway's MAC instead.
+
+---
+
+## Layer 4 — TCP and UDP
+
+Layer 4 multiplexes traffic between applications using **port numbers**:
+
+| Port | Common use |
+|---|---|
+| `80` | HTTP |
+| `443` | HTTPS |
+| `3306` | MySQL |
+
+**TCP** provides a reliable, ordered, connection-oriented stream.
+**UDP** is connectionless and faster but offers no delivery guarantees.
+
+---
+
+## TCP three-way handshake
+
+Before any data is exchanged, TCP establishes a connection through a three-step process:
+
+```
+Client                          Server
+  │                                │
+  │  ── SYN ──────────────────► │   (client says: I want to connect)
+  │                                │
+  │  ◄─────────────── SYN-ACK ──  │   (server says: OK, I'm ready)
+  │                                │
+  │  ── ACK ──────────────────► │   (client says: confirmed)
+  │                                │
+  ╰──────── connection established ─────────╯
+```
+
+- **SYN** — client picks a random sequence number and sends it
+- **SYN-ACK** — server acknowledges the client's sequence number and sends its own
+- **ACK** — client acknowledges the server's sequence number
+
+Only after all three steps can data flow in both directions.
+
+---
+
+## TCP connection states
+
+Inspect active TCP connections with:
+
+```bash
+ss -tan
+```
+
+Common states you will see:
+
+| State | Meaning |
+|---|---|
+| `LISTEN` | Server is waiting for incoming connections on a port |
+| `ESTABLISHED` | Connection is active and data can flow |
+| `TIME_WAIT` | Connection is closed but the OS is waiting to ensure no delayed packets arrive. Lasts ~60 seconds. |
+| `CLOSE_WAIT` | Remote side has closed the connection but the local application has not closed its end yet. If you see many of these it usually points to a bug in the application. |
+
+> `TIME_WAIT` is normal and expected — it is a safety mechanism, not an error. `CLOSE_WAIT` lingering for a long time often indicates a connection leak in the application.

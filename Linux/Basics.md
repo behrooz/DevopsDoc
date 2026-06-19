@@ -442,3 +442,136 @@ shareProcessNamespace: true
 ```
 
 but this is not the default behavior.
+
+# Kubernetes Networking
+
+## Network Namespaces
+
+Every container gets its own isolated network stack. This includes:
+
+- its own network interface
+- its own routing table
+- its own firewall rules (iptables)
+- its own sockets
+
+This is why two containers can both listen on port 80 without conflict — they are in different network namespaces and never see each other's ports.
+
+---
+
+## How a packet leaves a pod
+
+Every pod has a virtual network interface called `eth0`. When a pod sends traffic outbound, the packet travels through a chain of virtual networking layers before reaching its destination.
+
+```
+Application
+     │
+     ▼
+eth0 (virtual NIC inside the pod)
+     │
+     ▼
+veth pair (virtual pipe — one end inside the pod, one end on the host)
+     │
+     ▼
+Bridge / CNI plugin (e.g. Calico, Cilium — connects pods across the node)
+     │
+     ▼
+Host networking (node's main network stack)
+     │
+     ▼
+Destination
+```
+
+### Key components
+
+| Component | What it does |
+|---|---|
+| `eth0` | The pod's own virtual NIC, created when the pod starts |
+| veth pair | A virtual cable — packets written to one end appear on the other |
+| Bridge / CNI | A virtual switch on the host that connects all pod veth ends |
+| Host networking | The node's real network stack, where NAT and routing happen |
+
+> The CNI (Container Network Interface) plugin — such as Calico, Cilium, or Flannel — is responsible for creating the veth pairs, configuring the bridge, and setting up routing rules when a pod is scheduled.
+
+---
+
+---
+
+# NAT, IP Masquerading, and conntrack
+
+## When a packet arrives at the host network
+
+When a packet enters the host server's network namespace, Linux checks the destination:
+
+- If the destination is a **pod on the same node**, the packet is forwarded directly to that pod via the virtual switch (Linux bridge or veth pair, depending on the CNI plugin).
+- If the destination is **outside the node** (e.g. the internet), the packet goes to the routing table for forwarding.
+
+---
+
+## IP Masquerading (SNAT)
+
+Pod IP addresses are internal (private) and not routable on the public internet. When a pod sends outbound traffic, the host performs **IP Masquerading** — a form of Source NAT (SNAT) — which replaces the pod's internal source IP with the node's own public IP.
+
+This allows the remote destination to know where to send the reply.
+
+> Example: Pod A at `10.0.0.5` sends a packet to Google. The node rewrites the source to `<node-IP>` before forwarding it.
+
+---
+
+## conntrack (Connection Tracking)
+
+`conntrack` is the Linux kernel's connection tracking table. It acts as a stateful record of every active NAT translation.
+
+When the host performs masquerading, it simultaneously writes a conntrack entry:
+
+| Field | Value |
+|---|---|
+| Original source | `10.0.0.5` (Pod A) |
+| Rewritten source | `<node-IP>` |
+| Destination | `8.8.8.8` (Google) |
+
+> Note: iptables (or nftables) rules are what *trigger* the masquerade on the first packet. conntrack then handles all subsequent packets in that flow automatically — no iptables lookup needed per-packet.
+
+---
+
+## The return path
+
+1. Google sends a reply to the node's IP.
+2. The kernel looks up the conntrack table.
+3. It finds the matching entry: *"this reply belongs to Pod A."*
+4. It performs reverse NAT (DNAT) — rewrites the destination from `<node-IP>` back to `10.0.0.5`.
+5. The packet is forwarded to Pod A.
+
+```
+Pod A (10.0.0.5)
+     │  outbound
+     ▼
+iptables (SNAT: src → node-IP)  ──writes──▶  conntrack table
+     │
+     ▼
+Routing table ──────────────────────────────▶  Internet (Google)
+                                                      │
+                                               reply arrives
+                                                      │
+                                             conntrack lookup
+                                                      │
+                                          reverse DNAT (dst → 10.0.0.5)
+                                                      │
+                                                      ▼
+                                               Pod A receives reply
+```
+
+---
+
+## Summary
+
+| Concept | Role |
+|---|---|
+| Network namespace | Isolates each container's network stack |
+| eth0 | Virtual NIC inside the pod |
+| veth pair | Virtual pipe connecting pod to host bridge |
+| Bridge / CNI | Virtual switch connecting all pods on the node |
+| Virtual switch | Forwards packets between pods on the same node |
+| Routing table | Forwards packets destined outside the node |
+| IP Masquerading | Replaces pod IP with node IP for outbound traffic |
+| iptables | Applies the masquerade rule on the first packet |
+| conntrack | Records the NAT mapping; handles reverse translation on return |
